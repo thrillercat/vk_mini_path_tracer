@@ -64,6 +64,25 @@ int main(int argc, const char** argv)
   nvvk::Context context;     // Encapsulates device state in a single object
   context.init(deviceInfo);  // Initialize the context
 
+  // Get the GPU timestamp resolution.
+  VkPhysicalDeviceProperties gpuProperties{};
+  vkGetPhysicalDeviceProperties(
+    context.m_physicalDevice, &gpuProperties);
+
+  const double timestampPeriod =
+    gpuProperties.limits.timestampPeriod;
+
+  // Create two timestamp queries.
+  VkQueryPoolCreateInfo queryInfo{
+    VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO
+  };
+  queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+  queryInfo.queryCount = 2;
+
+  VkQueryPool timestampPool;
+  NVVK_CHECK(vkCreateQueryPool(
+    context, &queryInfo, nullptr, &timestampPool));
+
   // Create the allocator
   nvvk::ResourceAllocatorDedicated allocator;
   allocator.init(context, context.m_physicalDevice);
@@ -249,9 +268,28 @@ int main(int argc, const char** argv)
   vkCmdBindDescriptorSets(cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, descriptorSetContainer.getPipeLayout(), 0, 1,
                           &descriptorSet, 0, nullptr);
 
+  // Reset timestamp, and then start timing right before execution
+  vkCmdResetQueryPool(cmdBuffer, timestampPool, 0, 2);
+
+  vkCmdWriteTimestamp(
+    cmdBuffer,
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    timestampPool,
+    0
+  );
+
   // Run the compute shader with enough workgroups to cover the entire buffer:
   vkCmdDispatch(cmdBuffer, (uint32_t(render_width) + workgroup_width - 1) / workgroup_width,
                 (uint32_t(render_height) + workgroup_height - 1) / workgroup_height, 1);
+
+
+  // Another timer right after execution
+  vkCmdWriteTimestamp(
+    cmdBuffer,
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    timestampPool,
+    1
+  );
 
   // Add a command that says "Make it so that memory writes by the compute shader
   // are available to read from the CPU." (In other words, "Flush the GPU caches
@@ -271,6 +309,27 @@ int main(int argc, const char** argv)
   // End and submit the command buffer, then wait for it to finish:
   EndSubmitWaitAndFreeCommandBuffer(context, context.m_queueGCT, cmdPool, cmdBuffer);
 
+  // Caculate elapsed time
+  uint64_t timestamps[2] = {};
+
+  NVVK_CHECK(vkGetQueryPoolResults(
+    context,
+    timestampPool,
+    0,
+    2,
+    sizeof(timestamps),
+    timestamps,
+    sizeof(uint64_t),
+    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT
+  ));
+
+  double elapsedMs =
+    double(timestamps[1] - timestamps[0])
+    * timestampPeriod / 1e6;
+
+  printf("GPU compute time: %.3f ms\n", elapsedMs);
+  allocator.finalizeAndReleaseStaging();
+
   // Get the image data back from the GPU
   void* data = allocator.map(buffer);
   stbi_write_hdr("out.hdr", render_width, render_height, 3, reinterpret_cast<float*>(data));
@@ -283,6 +342,7 @@ int main(int argc, const char** argv)
   allocator.destroy(vertexBuffer);
   allocator.destroy(indexBuffer);
   vkDestroyCommandPool(context, cmdPool, nullptr);
+  vkDestroyQueryPool(context,timestampPool,nullptr);
   allocator.destroy(buffer);
   allocator.deinit();
   context.deinit();  // Don't forget to clean up at the end of the program!
